@@ -1,0 +1,443 @@
+<html>
+<style>
+body { font-family: sans-serif; margin: 2rem; background: #f9fafb; color: #333; }
+h1 { font-size: 1.6rem; margin-bottom: 0.5rem; }
+h2 { font-size: 1.2rem; margin-top: 1.5rem; }
+fieldset { border: 1px solid #ddd; padding: 1rem; border-radius: 8px; background: #fff; }
+label { display: inline-block; margin: 0.5rem 0; font-weight: 500; }
+input[type="range"] { width: 300px; margin: 0.5rem 0; }
+output { display: inline-block; margin-left: 0.5rem; font-weight: bold; }
+button { margin: 0.5rem 0.3rem; padding: 0.4rem 1rem; border: none; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; font-size: 0.95rem; }
+button:hover { background: #1d4ed8; }
+canvas { display: block; margin: 1rem 0; border: 1px solid #ccc; border-radius: 6px; background: white; }
+figcaption { font-size: 0.9rem; margin-bottom: 0.3rem; color: #555; }
+
+</style>
+<header>
+  <h1>Interactive Spectrum Demo</h1>
+  <p>Generate a tone and visualize its waveform and Fourier spectrum.</p>
+</header>
+
+<main>
+  <section aria-labelledby="controls-title">
+    <h2 id="controls-title">Controls</h2>
+
+    <fieldset>
+      <legend>Signal</legend>
+
+      <table>
+        <tr>
+      <td><label for="freq">Center frequency (Hz):</label></td>
+      <td><input id="freq" name="freq" type="range" min="220" max="880" value="440" step="1"></td>
+      <td><output id="freqValue" for="freq">440</output></td>
+    </tr>
+    <tr>
+      <td><label for="smooth">Smoothing half-width (Hz):</label></td>
+      <td><input id="smooth" type="range" min="0" max="100" step="1" value="5"></td>
+      <td><output id="smoothValue" for="smooth">5</output></td>
+  </tr>
+</table>
+
+      <div>
+        <button id="playPause">Play</button>
+        <button id="stop">Stop</button>
+        <label for="volume">Volume:</label>
+        <input id="volume" name="volume" type="range" min="0" max="5" value="1" step="0.1">
+      </div>
+    </fieldset>
+  </section>
+
+  <section aria-labelledby="views-title">
+    <h2 id="views-title">Views</h2>
+
+    <figure>
+      <figcaption>Time-domain signal</figcaption>
+      <canvas id="waveform" width="800" height="180" aria-label="Waveform display"></canvas>
+    </figure>
+
+    <figure>
+      <figcaption>Frequency spectrum</figcaption>
+      <canvas id="spectrum" width="800" height="240" aria-label="Spectrum display"></canvas>
+    </figure>
+  </section>
+
+  <section aria-labelledby="notes-title">
+    <h2 id="notes-title">Notes</h2>
+    <ul>
+      <li>The slider sets the tone's center frequency (around 440 Hz).</li>
+      <li>The tone will be broadband around the center (not a pure sine).</li>
+      <li>The spectrum updates while audio is playing.</li>
+    </ul>
+  </section>
+</main>
+
+<script>
+let audioCtx, osc, modSrc, modLP, modDepth, outGain, analyser, rafId;
+let freqSlider, freqOut, playBtn, stopBtn, volumeSlider, smoothSlider, smoothOut;
+let waveCanvas, specCanvas, wctx, sctx, waveData;
+
+// ---- Spectrum state (periodogram + smoothing) ----
+let sp_N = 0, sp_sr = 0;
+let tdBuf, re, im, Pxx, PxxSm, freqs;
+let kernel = null, kernelHalfBins = -1;
+let specW = 0, specH = 0;
+let smoothHz = 5; // default smoothing half-width (Hz)
+
+// ---- DOM ----
+window.addEventListener("DOMContentLoaded", () => {
+  freqSlider   = document.getElementById("freq");
+  freqOut      = document.getElementById("freqValue");
+  playBtn      = document.getElementById("playPause");
+  stopBtn      = document.getElementById("stop");
+  volumeSlider = document.getElementById("volume");
+  smoothSlider = document.getElementById("smooth");
+  smoothOut    = document.getElementById("smoothValue");
+  waveCanvas   = document.getElementById("waveform");
+  specCanvas   = document.getElementById("spectrum");
+  wctx         = waveCanvas?.getContext("2d");
+  sctx         = specCanvas?.getContext("2d");
+  specW        = specCanvas?.width  || 0;
+  specH        = specCanvas?.height || 0;
+
+  // Frequency slider
+  freqSlider.addEventListener("input", () => {
+    const f = parseFloat(freqSlider.value);
+    const q  = Math.max(0.001, f / Math.max(1, 2 * HALF_WIDTH_HZ)); // ≈ center / (2*halfWidth)
+    freqOut.textContent = f.toFixed(0);
+    if (osc) osc.frequency.setTargetAtTime(f, audioCtx.currentTime, 0.01);
+    if (bp1) {bp1.frequency.value = f; bp1.Q.value = q;}
+    if (bp2) {bp2.frequency.value = f; bp2.Q.value = q;}
+  });
+
+  // Volume slider (linear 0..2)
+  volumeSlider.min = "0"; volumeSlider.max = "2"; volumeSlider.step = "0.01";
+  volumeSlider.addEventListener("input", () => {
+    if (!outGain) return;
+    const g = parseFloat(volumeSlider.value);
+    outGain.gain.setTargetAtTime(g, audioCtx.currentTime, 0.03);
+  });
+
+  // Smoothing slider (Hz)
+  if (smoothSlider) {
+    smoothSlider.min = "0"; smoothSlider.max = "100"; smoothSlider.step = "1";
+    smoothSlider.value ||= String(smoothHz);
+    smoothOut && (smoothOut.textContent = smoothSlider.value);
+    smoothSlider.addEventListener("input", () => {
+      smoothHz = parseFloat(smoothSlider.value) || 0;
+      smoothOut && (smoothOut.textContent = smoothSlider.value);
+      invalidateKernel();
+    });
+  }
+
+  // Transport
+  playBtn.addEventListener("click", async () => {
+    if (!audioCtx) initAudio();
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+    startVisuals();
+  });
+
+  stopBtn.addEventListener("click", async () => {
+    if (audioCtx && audioCtx.state === "running") {
+      await audioCtx.suspend();
+      stopVisuals();
+    }
+  });
+});
+
+// ---- Audio graph: sine + autocorrelated FM ----
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  // Fixed params
+  HALF_WIDTH_HZ = 40;   // noise half-width (fixed)
+  const NOISE_LEVEL   = 0.85; // noise path level (0..1)
+  const SINE_LEVEL    = 0.15;  // sine path level (0..1)
+
+  // ---- Noise source (looped) ----
+  const bufLen = Math.floor(audioCtx.sampleRate * 2);
+  const noiseBuf = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+  const x = noiseBuf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++) x[i] = Math.random() * 2 - 1;
+
+  noiseSrc = audioCtx.createBufferSource();
+  noiseSrc.buffer = noiseBuf;
+  noiseSrc.loop = true;
+
+  // ---- Bandpass (cascaded) ----
+  const f0 = parseFloat(freqSlider?.value || "440");
+  const q  = Math.max(0.001, f0 / Math.max(1, 2 * HALF_WIDTH_HZ)); // ≈ center / (2*halfWidth)
+  bp1 = audioCtx.createBiquadFilter(); bp1.type = "bandpass"; bp1.frequency.value = f0; bp1.Q.value = q;
+  bp2 = audioCtx.createBiquadFilter(); bp2.type = "bandpass"; bp2.frequency.value = f0; bp2.Q.value = q;
+
+  // ---- Noise gain ----
+  noiseGain = audioCtx.createGain();
+  noiseGain.gain.value = NOISE_LEVEL;
+
+  // ---- Sine oscillator path ----
+  osc = audioCtx.createOscillator();
+  osc.type = "sine";
+  osc.frequency.value = f0;
+
+  const sineGain = audioCtx.createGain();
+  sineGain.gain.value = SINE_LEVEL;
+
+  // ---- Master out + analyser ----
+  outGain = audioCtx.createGain();
+  outGain.gain.value = parseFloat(volumeSlider?.value || "1");
+
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 8192;
+  analyser.smoothingTimeConstant = 0.0;
+
+  // ---- Wiring: both paths sum at outGain (addition happens automatically) ----
+  noiseSrc.connect(bp1).connect(bp2).connect(noiseGain).connect(outGain);
+  osc.connect(sineGain).connect(outGain);
+
+  outGain.connect(analyser).connect(audioCtx.destination);
+
+  // ---- Start ----
+  noiseSrc.start();
+  osc.start();
+
+  // For your drawings
+  waveData = new Uint8Array(analyser.fftSize);
+}
+
+// ---- Visuals ----
+function startVisuals() {
+  if (rafId) return;
+  const draw = () => {
+    rafId = requestAnimationFrame(draw);
+
+    // Waveform
+    if (wctx && analyser) {
+      analyser.getByteTimeDomainData(waveData);
+      const W = waveCanvas.width, H = waveCanvas.height;
+      wctx.clearRect(0, 0, W, H);
+      wctx.beginPath();
+      const step = W / waveData.length;
+      for (let i = 0; i < waveData.length; i++) {
+        const v = waveData[i] / 128 - 1;
+        const y = H * 0.5 - v * (H * 0.45);
+        const x = i * step;
+        i ? wctx.lineTo(x, y) : wctx.moveTo(x, y);
+      }
+      wctx.stroke();
+    }
+
+    // Smoothed periodogram
+    updateSpectrumFrame();
+  };
+  draw();
+}
+
+function stopVisuals() {
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = null;
+}
+
+// ---- Smoothed periodogram (cosine-bell) ----
+function ensureSpectrumBuffers() {
+  if (!analyser) return false;
+  const N = analyser.fftSize;
+  const sr = audioCtx.sampleRate;
+  if (N !== sp_N || sr !== sp_sr) {
+    sp_N = N; sp_sr = sr;
+    tdBuf = new Float32Array(N);
+    re    = new Float32Array(N);
+    im    = new Float32Array(N);
+    const M = N/2 + 1;
+    Pxx   = new Float32Array(M);
+    PxxSm = new Float32Array(M);
+    freqs = new Float32Array(M);
+    const binHz = sr / N;
+    for (let k = 0; k < M; k++) freqs[k] = k * binHz;
+    invalidateKernel();
+  }
+  return true;
+}
+
+function invalidateKernel() { kernel = null; }
+
+function buildCosineBellKernel(halfBins) {
+  if (halfBins <= 0) { const k = new Float32Array(1); k[0] = 1; return k; }
+  const L = 2*halfBins + 1, k = new Float32Array(L);
+  let sum = 0;
+  for (let i = 0; i < L; i++) {
+    const n = i - halfBins; // -K..K
+    const w = 0.5 * (1 + Math.cos(Math.PI * n / halfBins));
+    k[i] = w; sum += w;
+  }
+  for (let i = 0; i < L; i++) k[i] /= sum;
+  return k;
+}
+
+// In-place radix-2 FFT
+function fftRadix2(re, im) {
+  const N = re.length;
+  let j = 0;
+  for (let i = 0; i < N; i++) {
+    if (i < j) { const tr = re[i]; re[i] = re[j]; re[j] = tr; const ti = im[i]; im[i] = im[j]; im[j] = ti; }
+    let m = N >> 1;
+    while (m && j >= m) { j -= m; m >>= 1; }
+    j += m;
+  }
+  for (let len = 2; len <= N; len <<= 1) {
+    const half = len >> 1, ang = -2 * Math.PI / len;
+    const wpr = Math.cos(ang), wpi = Math.sin(ang);
+    for (let i = 0; i < N; i += len) {
+      let wr = 1, wi = 0;
+      for (let k = 0; k < half; k++) {
+        const j = i + k;
+        const tR = wr * re[j + half] - wi * im[j + half];
+        const tI = wr * im[j + half] + wi * re[j + half];
+        re[j + half] = re[j] - tR; im[j + half] = im[j] - tI;
+        re[j] += tR;              im[j] += tI;
+        const tmp = wr;
+        wr = tmp * wpr - wi * wpi;
+        wi = tmp * wpi + wi * wpr;
+      }
+    }
+  }
+}
+
+function computePeriodogramSmoothed() {
+  if (!ensureSpectrumBuffers()) return;
+  analyser.getFloatTimeDomainData(tdBuf);
+  re.set(tdBuf); im.fill(0);
+  fftRadix2(re, im);
+
+  const N = sp_N, M = N/2 + 1, invN2 = 1 / (N*N);
+  for (let k = 0; k < M; k++) {
+    let p = re[k]*re[k] + im[k]*im[k];
+    if (k !== 0 && k !== (N>>1)) p *= 2;
+    Pxx[k] = p * invN2;
+  }
+
+  const binHz = sp_sr / N;
+  const halfBins = Math.max(0, Math.round(smoothHz / binHz));
+  if (!kernel || kernelHalfBins !== halfBins) {
+    kernel = buildCosineBellKernel(halfBins);
+    kernelHalfBins = halfBins;
+  }
+
+  const K = kernelHalfBins;
+  for (let i = 0; i < M; i++) {
+    let num = 0, den = 0;
+    const j0 = Math.max(0, i - K), j1 = Math.min(M - 1, i + K);
+    for (let j = j0; j <= j1; j++) {
+      const w = kernel[j - i + K];
+      num += w * Pxx[j]; den += w;
+    }
+    PxxSm[i] = den ? num / den : 0;
+  }
+}
+
+// Replace your existing drawSmoothedSpectrum with this "zoomed" version
+function drawSmoothedSpectrum() {
+  if (!sctx || !PxxSm || !sp_sr || !sp_N) return;
+
+  const [fMin, fMax] = getViewRangeHz();
+  const nyq   = sp_sr / 2;
+  const binHz = sp_sr / sp_N;
+
+  // Convert Hz window -> bin indices
+  const startBin = Math.max(0, Math.floor(fMin / binHz));
+  const endBin   = Math.min(PxxSm.length - 1, Math.ceil(fMax / binHz));
+  const spanBins = endBin - startBin;
+  if (spanBins <= 0) return;
+
+  // dB scaling computed over the visible range only
+  const eps = 1e-20;
+  let maxdB = -Infinity;
+  for (let k = startBin; k <= endBin; k++) {
+    const dB = 10 * Math.log10(PxxSm[k] + eps);
+    if (dB > maxdB) maxdB = dB;
+  }
+  const mindB = maxdB - 80; // 80 dB window (adjust if you like)
+
+  // Draw
+  sctx.clearRect(0, 0, specW, specH);
+  sctx.beginPath();
+  for (let k = startBin; k <= endBin; k++) {
+    const dB = 10 * Math.log10(PxxSm[k] + eps);
+    const x = ((k - startBin) / spanBins) * (specW - 1);
+    const y = specH - ((dB - mindB) / (maxdB - mindB)) * (specH - 1);
+    (k === startBin) ? sctx.moveTo(x, y) : sctx.lineTo(x, y);
+  }
+  sctx.stroke();
+  drawFrequencyAxis(sctx, specW, specH, fMin, fMax);
+
+  // Frequency marker only if inside the view window
+  if (osc && typeof osc.frequency.value === "number" && false) {
+    const f = osc.frequency.value;
+    if (f >= fMin && f <= fMax && f <= nyq) {
+      const x = ((f - fMin) / (fMax - fMin)) * (specW - 1);
+      sctx.beginPath();
+      sctx.moveTo(x, 0);
+      sctx.lineTo(x, specH);
+      sctx.stroke();
+    }
+  }
+}
+
+function updateSpectrumFrame() {
+  computePeriodogramSmoothed();
+  drawSmoothedSpectrum();
+}
+
+// Helper: use the freq slider's range as the spectrum view window
+function getViewRangeHz() {
+  const nyq = sp_sr / 2;
+  const fMin = Math.max(0, parseFloat(freqSlider?.min || "0"));
+  const fMax = Math.min(nyq, parseFloat(freqSlider?.max || String(nyq)));
+  return [fMin, fMax];
+}
+
+</script>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<script>
+function drawFrequencyAxis(ctx, width, height, fMin, fMax, opts = {}) {
+  const axisH = opts.axisHeight ?? 24, tickLen = 6;
+  const targetTicks = opts.targetTicks ?? 6;
+  const range = Math.max(1e-9, fMax - fMin);
+  const raw = range / targetTicks, p10 = Math.pow(10, Math.floor(Math.log10(raw)));
+  const mul = raw / p10 <= 1 ? 1 : raw / p10 <= 2 ? 2 : raw / p10 <= 5 ? 5 : 10;
+  const step = mul * p10;
+  const toX = f => ((f - fMin) / range) * (width - 1);
+
+  const y = height - axisH + 0.5;
+  ctx.save();
+  ctx.strokeStyle = "#666"; ctx.fillStyle = "#333"; ctx.lineWidth = 1;
+  ctx.font = "15px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+
+  // baseline
+  ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke();
+
+  // ticks + labels
+  const start = Math.ceil(fMin / step) * step;
+  for (let f = start; f <= fMax + 1e-9; f += step) {
+    const x = toX(f) + 0.5;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + tickLen); ctx.stroke();
+    const label = f >= 1000 ? (Math.round(f / 100) / 10) + "k" : Math.round(f).toString();
+    ctx.fillText(label, x, y + tickLen + 2);
+  }
+  ctx.restore();
+}
+
+</script>
+
+</html>
